@@ -7,7 +7,7 @@
 #
 # 使用方法：
 #   ./task_with_notification.sh "<your_command>" [args...]
-#
+#   NO_PIPE=1 ./task_with_notification.sh "<your_command>" [args...]
 # 配置：
 #   在同目录创建 .bark_config 文件，内容为：
 #   BARK_DEVICE_KEY="your_bark_device_key"
@@ -244,10 +244,12 @@ echo -e "${GREEN}Start time: $(date)${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo ""
 
-# 执行命令并捕获错误输出
-eval "$TASK_COMMAND" 2>&1 | tee >(grep -i "error\|exception\|traceback\|failed" > "$ERROR_LOG" || true)
-
-# 获取命令的退出状态
-EXIT_STATUS=${PIPESTATUS[0]}
+if [ -n "$NO_PIPE" ]; then
+  eval "$TASK_COMMAND"
+  EXIT_STATUS=$?
+else
+  eval "$TASK_COMMAND" 2>&1 | tee >(grep -i "error\|exception\|traceback\|failed" > "$ERROR_LOG" || true)
+  EXIT_STATUS=${PIPESTATUS[0]}
+fi
 
 exit $EXIT_STATUS
