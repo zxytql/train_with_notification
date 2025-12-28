@@ -5,9 +5,15 @@
 # 任务完成了吗？用 BARK 推送告诉你！
 # 支持：正常完成、异常退出、手动中断（Ctrl+C）的实时通知
 #
-# 使用方法：
+# 使用方法（单任务）：
 #   ./task_with_notification.sh "<your_command>" [args...]
 #   NO_PIPE=1 ./task_with_notification.sh "<your_command>" [args...]
+# 使用方法（Multi-task）：
+#   ./task_with_notification.sh --tasks-file tasks.txt [--continue-on-failure]
+#   tasks.txt 中每行一条命令，支持 # 注释与空行
+#   可选：NO_PIPE=1 对所有任务禁用管道日志捕获
+#   可选：--dry-run 仅打印即将执行的任务队列
+#   默认遇到失败或中断停止队列，可用 --continue-on-failure 忽略失败继续
 # 配置：
 #   在同目录创建 .bark_config 文件，内容为：
 #   BARK_DEVICE_KEY="your_bark_device_key"
@@ -62,25 +68,63 @@ fi
 # 全局变量
 # =============================================================================
 
-TASK_COMMAND="$@"
-if [ -z "$TASK_COMMAND" ]; then
-    echo -e "${RED}✗ Usage: $0 <command> [args...]${NC}"
-    exit 1
-fi
-
-START_TIME=$(date +%s)
 HOSTNAME=$(hostname)
-
-# 创建错误日志目录（在当前目录下）
 ERROR_LOG_DIR="./error_logs"
 mkdir -p "$ERROR_LOG_DIR"
 
-# 使用时间戳命名错误日志
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-ERROR_LOG="${ERROR_LOG_DIR}/task_error_${TIMESTAMP}.log"
+TASKS=()
+TASKS_FILE=""
+CONTINUE_ON_FAILURE=0
+DRY_RUN=0
+STOP_ALL=0
+LAST_SIGNAL=""
 
-EXIT_STATUS=0
-EXIT_REASON="unknown"
+# =============================================================================
+# 帮助与参数解析
+# =============================================================================
+
+print_usage() {
+    cat << 'EOF'
+用法：
+  ./task_with_notification.sh "<command>" [args...]
+  ./task_with_notification.sh --tasks-file tasks.txt [--continue-on-failure] [--dry-run]
+
+可选：
+  --tasks-file <file>     Multi-task mode，文件中每行一条命令，忽略空行与以 # 开头的行
+  --continue-on-failure   遇到失败继续执行后续任务（默认失败停止）
+  --dry-run               仅打印解析到的任务，不执行
+  -h, --help              显示本帮助
+
+环境变量：
+  NO_PIPE=1  禁用管道捕获（适用于不希望 tee/grep 干预的命令）
+EOF
+}
+
+load_tasks_from_file() {
+    local file_path="$1"
+    if [ ! -f "$file_path" ]; then
+        echo -e "${RED}✗ Tasks file not found: ${file_path}${NC}"
+        exit 1
+    fi
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        # 去除前后空白
+        local trimmed="${line#"${line%%[![:space:]]*}"}"
+        trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+
+        # 跳过空行和注释
+        if [ -z "$trimmed" ] || [[ "$trimmed" =~ ^# ]]; then
+            continue
+        fi
+
+        TASKS+=("$trimmed")
+    done < "$file_path"
+
+    if [ ${#TASKS[@]} -eq 0 ]; then
+        echo -e "${RED}✗ No valid tasks found in ${file_path}${NC}"
+        exit 1
+    fi
+}
 
 # =============================================================================
 # BARK 推送函数
@@ -123,133 +167,276 @@ send_bark_notification() {
 # =============================================================================
 
 cleanup_and_notify() {
-    local exit_code=$?
-    local end_time=$(date +%s)
-    local duration=$((end_time - START_TIME))
-    local duration_formatted=$(printf '%02d:%02d:%02d' $((duration/3600)) $((duration%3600/60)) $((duration%60)))
-    
-    # 读取错误日志
+    local exit_code="$1"
+    local start_time="$2"
+    local error_log="$3"
+    local task_command="$4"
+    local task_index="$5"
+    local total_tasks="$6"
+    local is_multi="$7"
+
+    local end_time
+    end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+    local duration_formatted
+    duration_formatted=$(printf '%02d:%02d:%02d' $((duration/3600)) $((duration%3600/60)) $((duration%60)))
+
     local error_msg=""
-    if [ -s "$ERROR_LOG" ]; then
-        # 只取最后50行，避免消息过长
-        error_msg=$(tail -n 50 "$ERROR_LOG" | head -n 20)
+    if [ -n "$error_log" ] && [ -s "$error_log" ]; then
+        error_msg=$(tail -n 50 "$error_log" | head -n 20)
     fi
-    
-    # 确定退出状态
-    if [ $exit_code -eq 0 ]; then
-        EXIT_REASON="success"
-    elif [ $exit_code -eq 130 ]; then
-        EXIT_REASON="interrupted"  # Ctrl+C
+
+    local exit_reason="unknown"
+    if [ "$exit_code" -eq 0 ]; then
+        exit_reason="success"
+    elif [ "$exit_code" -eq 130 ] || [ "$exit_code" -eq 143 ]; then
+        exit_reason="interrupted"
     else
-        EXIT_REASON="error"
+        exit_reason="error"
     fi
-    
-    # 构建通知内容
+
+    local progress=""
+    if [ "$is_multi" -eq 1 ]; then
+        progress="${task_index}/${total_tasks}"
+    fi
+
     local title
     local body
     local level
-    
-    case "$EXIT_REASON" in
+
+    case "$exit_reason" in
         success)
             title="✅ Task Completed"
+            [ -n "$progress" ] && title="${title} [${progress}]"
             body="Host: ${HOSTNAME}
 Duration: ${duration_formatted}
-Command: ${TASK_COMMAND}"
+Command: ${task_command}"
+            if [ -n "$progress" ]; then
+                body="${body}
+Mode: Multi-task
+Progress: ${progress}"
+            fi
             level="active"
             echo -e "${GREEN}========================================${NC}"
             echo -e "${GREEN}Task completed successfully!${NC}"
             echo -e "${GREEN}Duration: ${duration_formatted}${NC}"
+            [ -n "$progress" ] && echo -e "${GREEN}Progress: ${progress}${NC}"
             echo -e "${GREEN}========================================${NC}"
             ;;
         interrupted)
             title="⚠️ Task Interrupted"
+            [ -n "$progress" ] && title="${title} [${progress}]"
             body="Host: ${HOSTNAME}
 Duration: ${duration_formatted}
 Reason: Manual interruption (Ctrl+C)"
+            if [ -n "$progress" ]; then
+                body="${body}
+Mode: Multi-task
+Progress: ${progress}"
+            fi
             level="timeSensitive"
             echo -e "${YELLOW}========================================${NC}"
             echo -e "${YELLOW}Task interrupted by user${NC}"
             echo -e "${YELLOW}Duration: ${duration_formatted}${NC}"
+            [ -n "$progress" ] && echo -e "${YELLOW}Progress: ${progress}${NC}"
             echo -e "${YELLOW}========================================${NC}"
             ;;
         error)
             title="❌ Task Failed"
+            [ -n "$progress" ] && title="${title} [${progress}]"
             body="Host: ${HOSTNAME}
 Duration: ${duration_formatted}
 Exit Code: ${exit_code}"
-            
-            # 添加错误信息（如果有）
+            if [ -n "$progress" ]; then
+                body="${body}
+Mode: Multi-task
+Progress: ${progress}"
+            fi
+
             if [ -n "$error_msg" ]; then
-                # 截断错误信息以适应推送限制
+                local error_preview
                 error_preview=$(echo "$error_msg" | head -n 5 | cut -c 1-200)
                 body="${body}
 
 Error Preview:
 ${error_preview}"
             fi
-            
+
             level="timeSensitive"
             echo -e "${RED}========================================${NC}"
             echo -e "${RED}Task failed with exit code: ${exit_code}${NC}"
             echo -e "${RED}Duration: ${duration_formatted}${NC}"
+            [ -n "$progress" ] && echo -e "${RED}Progress: ${progress}${NC}"
             if [ -n "$error_msg" ]; then
-                echo -e "${RED}Error log saved to: ${ERROR_LOG}${NC}"
+                echo -e "${RED}Error log saved to: ${error_log}${NC}"
                 echo -e "${RED}Last error lines:${NC}"
                 echo "$error_msg"
             fi
             echo -e "${RED}========================================${NC}"
             ;;
     esac
-    
-    # 发送 BARK 通知
+
     send_bark_notification "$title" "$body" "$level"
-    
-    # 清理日志文件
-    if [ "$EXIT_REASON" = "success" ]; then
-        # 成功时删除空日志
-        rm -f "$ERROR_LOG"
-    else
-        # 失败或中断时，如果日志为空也删除
-        if [ ! -s "$ERROR_LOG" ]; then
-            rm -f "$ERROR_LOG"
+
+    if [ -n "$error_log" ]; then
+        if [ "$exit_reason" = "success" ]; then
+            rm -f "$error_log"
+        else
+            if [ ! -s "$error_log" ]; then
+                rm -f "$error_log"
+            fi
         fi
     fi
-    
-    exit $exit_code
+
+    return "$exit_code"
 }
 
 # =============================================================================
-# 信号处理
+# =============================================================================
+# 任务执行与信号处理
 # =============================================================================
 
-# 捕获退出信号
-trap 'cleanup_and_notify' EXIT
+on_interrupt() {
+    STOP_ALL=1
+    LAST_SIGNAL="INT"
+}
 
-# 捕获中断信号 (Ctrl+C)
-trap 'exit 130' INT
+on_terminate() {
+    STOP_ALL=1
+    LAST_SIGNAL="TERM"
+}
 
-# 捕获终止信号
-trap 'exit 143' TERM
+trap 'on_interrupt' INT
+trap 'on_terminate' TERM
+
+run_task() {
+    local task_command="$1"
+    local task_index="$2"
+    local total_tasks="$3"
+    local is_multi="$4"
+
+    local start_time
+    start_time=$(date +%s)
+    local timestamp
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    local error_log="${ERROR_LOG_DIR}/task_error_${timestamp}_${task_index}.log"
+
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "${GREEN}Did-It-Work? 🤔${NC}"
+    echo -e "${GREEN}Task notification enabled via BARK${NC}"
+    echo -e "${GREEN}Host: ${HOSTNAME}${NC}"
+    if [ "$is_multi" -eq 1 ]; then
+        echo -e "${GREEN}Mode: Multi-task (${task_index}/${total_tasks})${NC}"
+    else
+        echo -e "${GREEN}Mode: Single-task${NC}"
+    fi
+    echo -e "${GREEN}Command: ${task_command}${NC}"
+    echo -e "${GREEN}Start time: $(date)${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    echo ""
+
+    local exit_status=0
+    if [ -n "$NO_PIPE" ]; then
+        eval "$task_command"
+        exit_status=$?
+    else
+        eval "$task_command" 2>&1 | tee >(grep -i "error\|exception\|traceback\|failed" > "$error_log" || true)
+        exit_status=${PIPESTATUS[0]}
+    fi
+
+    cleanup_and_notify "$exit_status" "$start_time" "$error_log" "$task_command" "$task_index" "$total_tasks" "$is_multi"
+    return "$exit_status"
+}
 
 # =============================================================================
-# 执行任务命令
+# 参数解析与主流程
 # =============================================================================
 
-echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN}Did-It-Work? 🤔${NC}"
-echo -e "${GREEN}Task notification enabled via BARK${NC}"
-echo -e "${GREEN}Host: ${HOSTNAME}${NC}"
-echo -e "${GREEN}Command: ${TASK_COMMAND}${NC}"
-echo -e "${GREEN}Start time: $(date)${NC}"
-echo -e "${GREEN}========================================${NC}"
-echo ""
+# 解析选项
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --tasks-file)
+            TASKS_FILE="$2"
+            shift 2
+            ;;
+        --continue-on-failure)
+            CONTINUE_ON_FAILURE=1
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
 
-if [ -n "$NO_PIPE" ]; then
-  eval "$TASK_COMMAND"
-  EXIT_STATUS=$?
+if [ -n "$TASKS_FILE" ]; then
+    load_tasks_from_file "$TASKS_FILE"
 else
-  eval "$TASK_COMMAND" 2>&1 | tee >(grep -i "error\|exception\|traceback\|failed" > "$ERROR_LOG" || true)
-  EXIT_STATUS=${PIPESTATUS[0]}
+    TASK_COMMAND="$*"
+    if [ -z "$TASK_COMMAND" ]; then
+        print_usage
+        exit 1
+    fi
+    TASKS+=("$TASK_COMMAND")
 fi
 
-exit $EXIT_STATUS
+TOTAL_TASKS=${#TASKS[@]}
+if [ "$TOTAL_TASKS" -eq 0 ]; then
+    print_usage
+    exit 1
+fi
+
+IS_MULTI=0
+if [ -n "$TASKS_FILE" ] || [ "$TOTAL_TASKS" -gt 1 ]; then
+    IS_MULTI=1
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo -e "${YELLOW}Dry run mode. Tasks to execute:${NC}"
+    for idx in "${!TASKS[@]}"; do
+        printf "  [%d/%d] %s\n" $((idx + 1)) "$TOTAL_TASKS" "${TASKS[$idx]}"
+    done
+    exit 0
+fi
+
+OVERALL_STATUS=0
+for idx in "${!TASKS[@]}"; do
+    if [ "$STOP_ALL" -eq 1 ]; then
+        echo -e "${YELLOW}Stop signal received, skipping remaining tasks.${NC}"
+        if [ "$OVERALL_STATUS" -eq 0 ]; then
+            OVERALL_STATUS=130
+        fi
+        break
+    fi
+
+    task_number=$((idx + 1))
+    run_task "${TASKS[$idx]}" "$task_number" "$TOTAL_TASKS" "$IS_MULTI"
+    exit_code=$?
+
+    if [ $exit_code -ne 0 ]; then
+        OVERALL_STATUS=$exit_code
+        if [ "$CONTINUE_ON_FAILURE" -ne 1 ]; then
+            echo -e "${YELLOW}Stopping queue due to failure/interruption at task ${task_number}/${TOTAL_TASKS}${NC}"
+            break
+        fi
+    fi
+
+    if [ "$STOP_ALL" -eq 1 ]; then
+        echo -e "${YELLOW}Stop signal received, ending remaining tasks.${NC}"
+        break
+    fi
+done
+
+exit "$OVERALL_STATUS"

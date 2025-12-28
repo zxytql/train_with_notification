@@ -32,6 +32,26 @@ BARK_SERVER="https://api.day.app"
 ./script/task_with_notification.sh "python run_experiment.py --config exp.yaml"
 ```
 
+### 3. 运行多任务队列（串行，逐任务推送）
+
+1) 准备任务文件（每行一条命令，支持 # 注释与空行）：
+```bash
+cat > tasks.txt <<'EOF'
+echo first && sleep 1
+python run_exp.py --config a.yaml
+EOF
+```
+
+2) 执行队列：
+```bash
+./script/task_with_notification.sh --tasks-file tasks.txt
+```
+
+可选：
+- `--continue-on-failure`：遇到失败也继续执行后续任务
+- `--dry-run`：仅打印队列，不执行
+- `NO_PIPE=1`：关闭所有任务的管道捕获（如命令对 stdout/stderr 有特殊要求）
+
 ---
 
 ## 功能特性
@@ -44,11 +64,17 @@ BARK_SERVER="https://api.day.app"
 | **手动中断** (Ctrl+C) | ⚠️ Task Interrupted  | 主机名、时长、原因                 | timeSensitive |
 | **任务报错**          | ❌ Task Failed       | 主机名、时长、退出码、**错误预览** | timeSensitive |
 
+### 🔁 多任务队列（串行执行）
+
+- `--tasks-file` 读取命令列表，默认遇到失败/中断停止，可用 `--continue-on-failure` 继续
+- 每个任务完成时单独推送，标题/正文显示 `Multi-task` 与进度（如 `1/3`），包含该任务耗时
+- 支持 `--dry-run` 预览队列；`NO_PIPE=1` 全局关闭管道捕获
+
 ### 📋 错误日志
 
 **智能日志管理**：
 - 自动捕获 stderr 中的 `error`、`exception`、`traceback`、`failed` 关键词
-- 保存位置：`./error_logs/task_error_YYYYMMDD_HHMMSS.log`
+- 保存位置：`./error_logs/task_error_YYYYMMDD_HHMMSS[_N].log`（多任务时带序号）
 - 时间戳命名：易于识别和追溯
 - 推送中显示错误预览（前5行，最多200字符）
 - 智能清理：成功时删除空日志，失败时保留完整日志
@@ -56,7 +82,7 @@ BARK_SERVER="https://api.day.app"
 **日志目录结构**：
 ```
 ./error_logs/
-├── task_error_20251203_154634.log  ← 最新错误
+├── task_error_20251203_154634_1.log  ← 末尾数字为队列序号
 ├── task_error_20251203_093022.log
 └── task_error_20251202_210145.log
 ```
@@ -95,6 +121,17 @@ BARK_SERVER="https://api.day.app"
 ```bash
 ./script/task_with_notification.sh "python run_experiment.py --config exp.yaml"
 ./script/task_with_notification.sh "bash scripts/data_pipeline.sh --input data/raw"
+```
+
+### 示例 6：多任务队列（带进度通知）
+```bash
+cat > tasks.txt <<'EOF'
+echo first && sleep 1
+echo second && sleep 1
+EOF
+
+./script/task_with_notification.sh --tasks-file tasks.txt --continue-on-failure
+# 先预览：./script/task_with_notification.sh --tasks-file tasks.txt --dry-run
 ```
 
 ---
